@@ -1,0 +1,347 @@
+
+select_washes <- function(poly.loc = NULL,
+                          area.name = "OWPM",
+                          n = 5 , 
+                          min.wash.km = 1, 
+                          max.wash.km = 5, 
+                          dist2roads.km = 2, 
+                          esc.slope = 25,
+                          save.file = TRUE,
+                          save.loc = tempdir()){
+  
+  #********************************************************************************************
+  # REQUIRE NEEDED PACKAGES --------------------------------
+  
+  list.of.packages <- c(
+    #data manipulation
+    "tidyverse", "lubridate", "BalancedSampling",
+    
+    #spatial data manipulation & plotting 
+    "sf", "tmap", "lwgeom", "nngeo", "rasterVis", "terra", "smoothr", "grid", "gstat", 
+    
+    #access datasets 
+    # to link with Arc feature layers
+    "httr",
+    
+    #DEMs
+    "elevatr", 
+    
+    #TIGER road and political boundary data (USA)
+    "tigris", 
+    
+    #National Hydrography Datasets
+    "FedData"
+  ) 
+  
+  lapply(list.of.packages, require, character.only = TRUE)
+
+  #********************************************************************************************
+  #LOAD PRIMARY SPATIAL DATA--------------------------------
+  
+  print("Preparing spatial layers")
+  
+  # define the survey area 
+  if(is.null(poly.loc)){
+    
+    survey.poly <- st_read("data/example_poly.gpkg")%>% st_transform(26911)} 
+  
+  else {
+    
+    survey.poly <- st_read(poly.loc)
+    
+  }
+  
+  # request DEM data 
+  elevation <- get_elev_raster( st_buffer(survey.poly, dist = 10000), z = 12) %>% terra::rast()
+  
+  
+  #********************************************************************************************
+  #DEFINE SEARCHABLE HABITAT BASED ON SLOPE--------------------------------
+  
+  #create slope raster
+  slope <- elevation %>% terrain(v = "slope", unit = "degrees", neighbors = 8)
+  
+  #classifies raster grids as habitat if slope >= 10%
+  habitat.m <- matrix( c(0, 10, 0, 10, Inf, 1), ncol = 3, byrow = TRUE)
+  habitat <- terra::classify(slope, habitat.m)
+  
+  #simplifies raster by decreasing resolution by a factor of 10
+  habitat2 <- terra::aggregate(habitat, fact = 10, fun = max )
+  
+  #turns raster into polygon, connecting adjacent grids and removing holes
+  hab.poly <- terra::as.polygons(habitat2, aggregate = TRUE) %>% 
+    st_as_sf() %>% 
+    st_transform(crs = st_crs(survey.poly)) %>% 
+    st_remove_holes() %>% 
+    filter(slope==1) %>% 
+    st_cast(to = "POLYGON")
+  
+  #simplifies polygons by first dropping any polygons less than 5 km^2 and then using a kernel-based smoother
+  hab.poly.simp <- hab.poly[survey.poly, op=st_intersects] %>% 
+    drop_crumbs(threshold = units::set_units(5, km^2)) %>% 
+    smooth(method = "ksmooth", bandwidth = 1000) %>% 
+    dplyr::select(slope) %>% 
+    st_transform(st_crs(survey.poly))
+  
+  #crops the habitat polygon to the population boundary (needed to exclude habitat that falls outside of boundary)
+  hab.poly.crop <- st_intersection(hab.poly.simp, survey.poly)
+  hab.bounds <- st_boundary(hab.poly.crop)
+  
+  #********************************************************************************************
+  #PULL ADDITIONAL SPATIAL DATA --------------------------------
+  
+  ## WILDERNESS BOUNDS -----------------------------
+  
+  #set up bounds to request wilderness areas
+  poly.bounds <- survey.poly %>% 
+    st_buffer(dist = 10000) %>% 
+    st_transform(4326) %>% 
+    st_bbox(survey.poly) 
+  
+  extent <- unname(poly.bounds) %>% paste(collapse = ",")
+  
+  # request wilderness areas that intersect with bounds from Wilderness Connect API (https://wilderness.net/default.php)
+  url <- parse_url("https://services1.arcgis.com/ERdCHt0sNM6dENSD/arcgis/rest/services/Wilderness_Areas_in_the_United_States/FeatureServer/0")
+  url$path <- paste(url$path, "query", sep = "/")
+  url$query <- list(where = "State = 'CA'",
+                    outFields = "*",
+                    geometry = extent,
+                    geom_type = "esriGeometryPolygon",
+                    sp_rel = "intersects",
+                    returnGeometry = "true",
+                    f = "geojson")
+  request <- build_url(url)
+  
+  wild.bounds <- st_read(request) %>% st_make_valid() %>% st_transform(crs=st_crs(survey.poly))
+  
+  
+  ## NHD FLOWLINES -----------------------------
+  
+  nhd.data <- get_nhd(hab.poly.crop, label = area.name)$Flowline %>% 
+    st_transform(crs = st_crs(survey.poly)) %>% 
+    st_intersection(hab.poly.crop) %>% 
+    st_cast(to = "MULTILINESTRING")
+  
+  
+  ## ROADS -----------------------------------
+  
+  ### Tigris - warning! these aren't entirely accurate and may not actually be drive-able
+  CAcounties <- counties(state = "California", class = "sf", cb = TRUE) %>% st_transform(crs = st_crs(survey.poly))
+  survey.county <- CAcounties[survey.poly, op=st_intersects]
+  
+  roads.tigris <-
+    rbind_tigris(
+      lapply(survey.county$COUNTYFP, function(x) {
+        roads(county = x, state = "California", class = "sf")
+      })
+    ) %>%
+    st_transform(crs = st_crs(survey.poly)) %>%
+    st_crop(st_buffer(survey.poly, 10000)) %>% 
+    st_filter(st_union(wild.bounds), .predicate = st_disjoint)
+  
+  ### Owlshead - may not be available for all areas, but should be the default if they are
+  roads.owl <- read_sf(dsn="data", layer = "RoadsOwlshead_EPSG26911") %>% 
+    st_transform(crs = st_crs(survey.poly)) %>% 
+    st_crop(st_buffer(survey.poly, 10000)) %>% 
+    filter(descriptio != "Type: ATV")
+  
+  
+  #********************************************************************************************
+  ## ADD DATA TO WASHES -----------------------------------
+  
+  #Add data to washes describing distance to edge of population unit & nearby roads
+  if( dim(roads.tigris)[1] > 0 ) { dist2tigris = unlist(st_nn(nhd.data, roads.tigris, returnDist = TRUE, sparse = TRUE)$dist)}else{ dist2tigris= NA}
+  if( dim(roads.owl)[1] > 0 ) { dist2owl = unlist(st_nn(nhd.data, roads.owl, returnDist = TRUE, sparse = TRUE)$dist)}else{ dist2owl= NA}
+  
+  washes <- nhd.data %>% 
+    mutate(
+      dist2edge = unlist(st_nn(., hab.bounds, returnDist = TRUE, sparse = TRUE)$dist),
+      dist2tigris = dist2tigris,
+      dist2owl = dist2owl,
+      dist2roads = pmin(dist2tigris, dist2owl, na.rm = TRUE)
+    )
+  
+  print("Spatial layers prepared")
+  
+  print("Calculating proportion escape terrain along washes")
+  
+  #Create escape terrain raster
+  reclass.m <- matrix( c(0, esc.slope, 0, esc.slope, Inf, 1), ncol = 3, byrow = TRUE)
+  escape <- classify(slope, reclass.m)
+  
+  #create buffer around washes to extract proportion of escape terrain within 300 m of wash
+  wash_buff <- st_buffer(washes, 300)
+  washes$prop_escape <- terra::extract(escape, wash_buff, fun = mean, na.rm = TRUE)$slope
+  
+  names(elevation)<- "elevation"
+  #Add minimum elevation to washes to ensure routes lead further into the range
+  washes$min_elev <- terra::extract(elevation, washes, fun = min, na.rm = TRUE)$elevation
+  
+  
+  #********************************************************************************************
+  # WASH SELECTION --------------------------------------------------------------------------
+  
+  #prepare objects for loop
+  routes <<- NULL
+  dont_eval <- NULL
+  i = 0
+  
+  #edges are the potential start of a route - need to be near the edge of the pop unit and near a road
+  edges <- filter(washes, dist2edge < 150 & dist2roads < dist2roads.km*1000)
+  
+  
+  if(dim(edges)[1] == 0){
+    print("No wash routes within specified distance to roads, try increasing dist2roads.km argument")
+  }else{
+    
+    # loop will connect wash segments that touch and head further up in elevation to create a set of possible wash routes
+    for(j in 1: dim(edges)[1]){
+      
+      evaluate <- edges[j,]
+      
+      if( !evaluate$OBJECTID %in% routes$OBJECTID ){ 
+        
+        repeat{  
+          
+          not.selected <- filter(washes,  !OBJECTID %in% c(evaluate$OBJECTID, dont_eval$OBJECTID) )  
+          touches <- not.selected[ lengths( st_touches(not.selected, evaluate[dim(evaluate)[1],]) ) > 0,] 
+          uphill <-  touches[ touches$min_elev > evaluate$min_elev[dim(evaluate)[1]],]
+          
+          if( dim(uphill)[1] == 0 &  
+              as.numeric( sum(st_length(evaluate)) ) >= min.wash.km*1000 
+          ){
+            
+            i = i + 1
+            evaluate$group_id <- paste0("group_",i)
+            routes <<- rbind(routes, evaluate)
+            break
+            
+          }else{
+            
+            if(dim(uphill)[1] == 0 & 
+               as.numeric(sum(st_length(evaluate))) < min.wash.km*1000
+            ){
+              
+              break
+              
+            }else{
+              new.escape <- NULL
+              for(k in 1:dim(uphill)[1]){ new.escape[k] <- sum( rbind(evaluate$prop_escape, uphill$prop_escape[k] )) }
+              
+              evaluate <- rbind(evaluate, uphill[which(new.escape==max(new.escape)),])
+              dont_eval <- rbind(dont_eval, uphill[which(new.escape!=max(new.escape)),])
+              
+              if(as.numeric(sum(st_length(evaluate))) > max.wash.km*1000 ){
+                i = i + 1
+                evaluate$group_id <- paste0("group_",i)
+                routes <<- rbind(routes, evaluate)
+                break
+              }
+            }
+          }
+        }
+        
+      }else{NULL}
+      
+    }
+    
+    # reduce to only consider routes than meet the min and max length reqs
+    group.summary <-
+      routes %>% 
+      mutate(length.m = as.numeric( st_length(routes)) ) %>% 
+      group_by(group_id) %>% 
+      dplyr::summarise(total.length = sum( length.m, na.rm = TRUE ),
+                       mean.escape = mean( prop_escape, na.rm = TRUE )) %>% 
+      ungroup() %>% 
+      filter(total.length > min.wash.km*1000, total.length < max.wash.km*1000)
+    
+    
+    #Examine routes that have repeated wash segments
+    #Keep only the route with the max escape terrain using that segment
+    doubles <- filter(routes, OBJECTID %in% routes$OBJECTID[duplicated(routes$OBJECTID)]) 
+    rep_ids <- unique(doubles$OBJECTID)
+    remove <- list()
+    
+    for(l in 1:length(rep_ids)){
+      
+      grps <- filter(doubles, OBJECTID == rep_ids[l]) %>% 
+        dplyr::select(group_id) %>%
+        st_drop_geometry() %>% 
+        distinct() %>% 
+        left_join(group.summary)
+      
+      remove[[l]] <- grps$group_id[-which.max(grps$mean.escape)] 
+    }
+    
+    grpsNoDups <- filter(group.summary, !group_id %in% unlist(remove) ) 
+    
+    
+    #Select the top wash routes with the highest total escape terrain
+    
+    if(dim(grpsNoDups)[1] < n){
+      paste("Not enough routes to meet specified n, returning all available routes")
+      final.select <<- grpsNoDups
+    }else{
+      
+      ###################################################################
+      #To select a spatially balanced sample of routes, use the local pivotal method in BalancedSampling package
+      #Inclusion probabilities defined by mean escape terrain
+      
+      #primary routes
+      p<-X<-Y<-NULL
+      for(i in 1:length(unique(grpsNoDups$group_id))){
+        pts <- grpsNoDups[i,] %>% st_cast("POINT")
+        X[i] <- st_coordinates(pts[1,])[1]
+        Y[i] <- st_coordinates(pts[1,])[2]
+        p[i] <- mean(grpsNoDups[i,]$mean.escape, na.rm=)
+      }
+      
+      P <- probabilities(p, n)
+      selected <- lpm2(P, cbind(X,Y))
+      
+      selected.routes <- grpsNoDups[selected,] %>% mutate(type = "selected", id = seq(from = 1, to = n, by =1))
+      not.selected.routes <- grpsNoDups[-selected,]
+      
+      #backup routes
+      p<-X<-Y<-NULL
+      for(i in 1:length(unique(not.selected.routes$group_id))){
+        pts <- not.selected.routes[i,] %>% st_cast("POINT")
+        X[i] <- st_coordinates(pts[1,])[1]
+        Y[i] <- st_coordinates(pts[1,])[2]
+        p[i] <- mean(not.selected.routes[i,]$mean.escape, na.rm=)
+      }
+      P <- probabilities(p, n)
+      backup <- lpm2(P, cbind(X,Y))
+      backup.routes <- not.selected.routes[backup,] %>% mutate(type = "backup", id = seq(from = n+1, to = n*2, by =1))
+      
+      routes <- rbind(selected.routes, backup.routes)
+      
+      
+      ##############################################################
+    }
+    
+    final.routes <<-
+      routes %>% dplyr::select(id, grp_id = group_id, type, leng_m = total.length, mean_esc = mean.escape)
+    
+    if(save.file){  
+      st_write(final.routes, paste0(save.loc, area.name, "_survey_routes.shp"), delete_layer = TRUE )
+    }
+    
+    print("Routes selected! Plotting results")
+    
+    wash_map <<-
+      tm_shape(roads.owl)+tm_lines(lwd=0)+
+      tm_shape(slope)+tm_raster(alpha=0.7, palette = "Greys", )+
+      tm_shape(washes)+tm_lines(col = "darkturquoise")+
+      tm_shape(final.routes)+tm_lines(col="type", palette = c("darkorange","darkred"), lwd=3)+
+      tm_shape(roads.owl)+tm_lines(lwd=0.5, lty=2, col="black")+
+      tm_shape(roads.tigris)+tm_lines(lwd=0.5, lty=2, col="mediumblue")+
+      tm_shape(survey.poly) + tm_borders(lwd=2)+
+      tm_scale_bar(text.size = 0.8,bg.color = "white")+
+      tm_layout(legend.outside = T, title = paste(area.name, "survey routes") )
+    
+    tmap_mode("plot")
+    return(wash_map)
+  }  
+}
+
